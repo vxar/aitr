@@ -107,12 +107,27 @@ class TradingDatabase:
                 )
             """)
             
+            # Create rejected_entries table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS rejected_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ticker TEXT NOT NULL,
+                    price REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    date TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             # Create indexes for better query performance
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_ticker ON trades(ticker)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_time ON trades(exit_time)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_ticker ON positions(ticker)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_positions_active ON positions(is_active)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_rejected_entries_date ON rejected_entries(date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_rejected_entries_ticker ON rejected_entries(ticker)")
             
             self.conn.commit()
             
@@ -574,13 +589,25 @@ class TradingDatabase:
                     logger.warning(f"Skipping corrupted position row - no columns could be accessed. Row type: {type(row)}")
                     # Try to get row ID for deletion if possible
                     try:
-                        row_id = row[0] if hasattr(row, '__getitem__') else None
+                        # Try multiple ways to get the ID
+                        row_id = None
+                        if hasattr(row, '__getitem__'):
+                            try:
+                                row_id = row[0] if len(row) > 0 else None
+                            except (IndexError, TypeError):
+                                pass
+                        if not row_id and hasattr(row, 'keys'):
+                            try:
+                                row_id = row.get('id') if 'id' in row.keys() else None
+                            except:
+                                pass
+                        
                         if row_id:
                             logger.info(f"Attempting to delete corrupted position with ID: {row_id}")
                             cursor.execute("DELETE FROM positions WHERE id = ?", (row_id,))
                             self.conn.commit()
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Could not delete corrupted row: {e}")
                     continue
                 
                 # Ensure required fields have values and ticker is valid
@@ -1015,6 +1042,92 @@ class TradingDatabase:
                 'portfolio_value': initial_capital,
                 'daily_trades_count': 0
             }
+    
+    def add_rejected_entry(self, ticker: str, price: float, reason: str, timestamp: datetime):
+        """
+        Add a rejected entry to the database
+        
+        Args:
+            ticker: Stock ticker symbol
+            price: Entry price that was rejected
+            reason: Reason for rejection
+            timestamp: Timestamp of the rejection
+        """
+        try:
+            cursor = self.conn.cursor()
+            date_str = timestamp.strftime('%Y-%m-%d')
+            timestamp_str = timestamp.isoformat()
+            
+            cursor.execute("""
+                INSERT INTO rejected_entries (ticker, price, reason, timestamp, date)
+                VALUES (?, ?, ?, ?, ?)
+            """, (ticker, price, reason, timestamp_str, date_str))
+            
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error adding rejected entry to database: {e}")
+            raise
+    
+    def get_rejected_entries(self, date: Optional[str] = None, limit: int = 200) -> List[Dict]:
+        """
+        Get rejected entries from database
+        
+        Args:
+            date: Date string in YYYY-MM-DD format. If None, returns today's entries
+            limit: Maximum number of entries to return
+        
+        Returns:
+            List of rejected entry dictionaries
+        """
+        try:
+            cursor = self.conn.cursor()
+            
+            if date:
+                date_str = date
+            else:
+                # Get today's date
+                from datetime import datetime
+                date_str = datetime.now().strftime('%Y-%m-%d')
+            
+            cursor.execute("""
+                SELECT ticker, price, reason, timestamp
+                FROM rejected_entries
+                WHERE date = ?
+                ORDER BY timestamp DESC
+                LIMIT ?
+            """, (date_str, limit))
+            
+            rows = cursor.fetchall()
+            entries = []
+            for row in rows:
+                entries.append({
+                    'ticker': row[0],
+                    'price': row[1],
+                    'reason': row[2],
+                    'timestamp': row[3]  # ISO format string
+                })
+            
+            return entries
+        except Exception as e:
+            logger.error(f"Error getting rejected entries from database: {e}")
+            return []
+    
+    def clear_rejected_entries_for_ticker(self, ticker: str):
+        """
+        Clear rejected entries for a specific ticker (when position is entered)
+        
+        Args:
+            ticker: Ticker symbol to clear entries for
+        """
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+                DELETE FROM rejected_entries
+                WHERE ticker = ?
+            """, (ticker,))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"Error clearing rejected entries for ticker {ticker}: {e}")
     
     def close(self):
         """Close database connection"""

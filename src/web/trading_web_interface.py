@@ -361,7 +361,7 @@ def get_monitoring_status():
         return jsonify({'error': 'Trading bot not initialized'}), 503
     
     try:
-        # Get top gainers list and data (separate from other sources)
+        # Get top gainers list and data
         top_gainers = getattr(trading_bot, 'top_gainers', [])
         top_gainers_data_full = getattr(trading_bot, 'top_gainers_data', [])
         top_gainers_set = set(top_gainers)
@@ -375,14 +375,18 @@ def get_monitoring_status():
                 gainer_change_map[symbol] = change_pct
         
         top_gainers_data = []
-        other_tickers_data = []
         
+        # Only process top gainers (all tickers should be from top gainers now)
         for ticker in trading_bot.tickers:
             # Skip null/empty tickers
             if not ticker or not str(ticker).strip():
                 continue
             
             ticker = str(ticker).strip()
+            
+            # Only include tickers that are in top gainers list
+            if ticker not in top_gainers_set:
+                continue
             
             status_info = trading_bot.monitoring_status.get(ticker, {
                 'status': 'monitoring',
@@ -399,65 +403,103 @@ def get_monitoring_status():
             current_price = None
             change_pct = gainer_change_map.get(ticker, None)
             
-            if ticker in top_gainers_set:
-                try:
-                    # Get minute data to get current price and calculate change percentage
-                    df_1min = trading_bot.data_api.get_1min_data(ticker, minutes=390)  # Get ~6.5 hours of data
-                    if df_1min is not None and not df_1min.empty and len(df_1min) > 0:
-                        # Always use the latest close price from minute data as current price
-                        current_price = float(df_1min.iloc[-1]['close'])
+            try:
+                # Get minute data to get current price and calculate change percentage
+                # Fetch more data to include previous day's close
+                df_1min = trading_bot.data_api.get_1min_data(ticker, minutes=800)  # Get enough data to include previous day
+                if df_1min is not None and not df_1min.empty and len(df_1min) > 0:
+                    # Always use the latest close price from minute data as current price
+                    current_price = float(df_1min.iloc[-1]['close'])
+                    
+                    # Check if we're in premarket, regular hours, or after hours
+                    from datetime import datetime
+                    import pytz
+                    et = pytz.timezone('US/Eastern')
+                    now_et = datetime.now(et)
+                    current_hour = now_et.hour
+                    current_minute = now_et.minute
+                    
+                    # Determine market session
+                    is_premarket = current_hour < 9 or (current_hour == 9 and current_minute < 30)
+                    is_regular_hours = (current_hour >= 9 and current_hour < 16) or (current_hour == 9 and current_minute >= 30)
+                    is_after_hours = current_hour >= 16  # 4:00 PM or later
+                    
+                    # Ensure timestamp column is timezone-aware (ET)
+                    df_copy = df_1min.copy()
+                    ts_series = pd.to_datetime(df_copy['timestamp'])
+                    if ts_series.dt.tz is None:
+                        # Timezone-naive, localize to ET
+                        ts_series = ts_series.dt.tz_localize('US/Eastern')
+                    else:
+                        # Already timezone-aware, convert to ET
+                        ts_series = ts_series.dt.tz_convert('US/Eastern')
+                    
+                    df_copy['timestamp_et'] = ts_series
+                    df_copy['date'] = ts_series.dt.date
+                    df_copy['hour'] = ts_series.dt.hour
+                    df_copy['minute'] = ts_series.dt.minute
+                    
+                    if is_after_hours:
+                        # For after hours: use day's close price (last regular market hour close, typically 4:00 PM)
+                        # Find the last close price before 4:00 PM using pandas
+                        day_close = None
                         
-                        # Check if we're in after hours (after 4:00 PM ET)
-                        from datetime import datetime
-                        import pytz
-                        et = pytz.timezone('US/Eastern')
-                        now_et = datetime.now(et)
-                        current_hour = now_et.hour
-                        is_after_hours = current_hour >= 16  # 4:00 PM or later
-                        
-                        if is_after_hours:
-                            # For after hours: use day's close price (last regular market hour close, typically 4:00 PM)
-                            # Find the last close price before 4:00 PM using pandas
-                            day_close = None
-                            
-                            # Ensure timestamp column is timezone-aware (ET)
-                            df_copy = df_1min.copy()
-                            ts_series = pd.to_datetime(df_copy['timestamp'])
-                            if ts_series.dt.tz is None:
-                                # Timezone-naive, localize to ET
-                                ts_series = ts_series.dt.tz_localize('US/Eastern')
-                            else:
-                                # Already timezone-aware, convert to ET
-                                ts_series = ts_series.dt.tz_convert('US/Eastern')
-                            
-                            # Find the last row before 4:00 PM (16:00)
-                            df_copy['hour'] = ts_series.dt.hour
-                            df_before_4pm = df_copy[df_copy['hour'] < 16]
-                            if not df_before_4pm.empty:
-                                # Get the last close price before 4 PM
-                                day_close = float(df_before_4pm.iloc[-1]['close'])
-                            else:
-                                # If no pre-4PM price found, use the first price of the day as fallback
-                                day_close = float(df_1min.iloc[0]['close'])
-                            
-                            # Calculate change percentage from day's close to current price
-                            if day_close > 0 and current_price:
-                                change_pct = ((current_price - day_close) / day_close) * 100
+                        # Find the last row before 4:00 PM (16:00)
+                        df_before_4pm = df_copy[df_copy['hour'] < 16]
+                        if not df_before_4pm.empty:
+                            # Get the last close price before 4 PM
+                            day_close = float(df_before_4pm.iloc[-1]['close'])
                         else:
-                            # Regular market hours: use first (opening) price
-                            first_close = float(df_1min.iloc[0]['close'])
-                            if first_close > 0 and current_price:
-                                # Calculate percentage change from opening price to current price
-                                change_pct = ((current_price - first_close) / first_close) * 100
-                except Exception as e:
-                    logger.debug(f"Could not get minute data for {ticker}: {e}")
-                    # Fallback to API current price
-                    try:
-                        current_price = trading_bot.data_api.get_current_price(ticker)
-                    except:
-                        current_price = status_info.get('current_price')
-            else:
-                # For non-top-gainers, use regular API current price
+                            # If no pre-4PM price found, use the first price of the day as fallback
+                            day_close = float(df_1min.iloc[0]['close'])
+                        
+                        # Calculate change percentage from day's close to current price
+                        if day_close > 0 and current_price:
+                            change_pct = ((current_price - day_close) / day_close) * 100
+                    else:
+                        # For premarket and regular hours: use previous day's close price
+                        previous_day_close = None
+                        today_date = now_et.date()
+                        
+                        # Find the last close price from the previous trading day
+                        # Get all data from previous day (before today)
+                        previous_day_data = df_copy[df_copy['date'] < today_date]
+                        
+                        if not previous_day_data.empty:
+                            # Find the last close from previous day (should be around 4 PM ET, the regular market close)
+                            # Filter for regular market hours (9:30 AM - 4:00 PM) on previous day
+                            prev_day_regular_hours = previous_day_data[
+                                ((previous_day_data['hour'] > 9) | 
+                                 ((previous_day_data['hour'] == 9) & (previous_day_data['minute'] >= 30))) &
+                                (previous_day_data['hour'] < 16)
+                            ]
+                            
+                            if not prev_day_regular_hours.empty:
+                                # Get the last close from regular market hours (should be at 4:00 PM)
+                                previous_day_close = float(prev_day_regular_hours.iloc[-1]['close'])
+                            else:
+                                # Fallback: use the last close from previous day
+                                previous_day_close = float(previous_day_data.iloc[-1]['close'])
+                        else:
+                            # If no previous day data found, try to use the first price before today's market open
+                            # This handles cases where data starts on the current day
+                            df_before_today_open = df_copy[
+                                (df_copy['date'] == today_date) & 
+                                ((df_copy['hour'] < 9) | 
+                                 ((df_copy['hour'] == 9) & (df_copy['minute'] < 30)))
+                            ]
+                            if not df_before_today_open.empty:
+                                previous_day_close = float(df_before_today_open.iloc[0]['close'])
+                            else:
+                                # Final fallback: use the first price in the dataset
+                                previous_day_close = float(df_1min.iloc[0]['close'])
+                        
+                        # Calculate change percentage from previous day's close to current price
+                        if previous_day_close > 0 and current_price:
+                            change_pct = ((current_price - previous_day_close) / previous_day_close) * 100
+            except Exception as e:
+                logger.debug(f"Could not get minute data for {ticker}: {e}")
+                # Fallback to API current price
                 try:
                     current_price = trading_bot.data_api.get_current_price(ticker)
                 except:
@@ -482,11 +524,7 @@ def get_monitoring_status():
                 'change_pct': change_pct  # Calculated change % from minute data (always a number for sorting)
             }
             
-            # Separate top gainers from other sources
-            if ticker in top_gainers_set:
-                top_gainers_data.append(ticker_data)
-            else:
-                other_tickers_data.append(ticker_data)
+            top_gainers_data.append(ticker_data)
         
         # Sort top gainers by calculated change percentage (descending - highest first)
         # Use the calculated change_pct value for sorting
@@ -497,7 +535,7 @@ def get_monitoring_status():
         
         return jsonify({
             'top_gainers': top_gainers_data,
-            'other_tickers': other_tickers_data,
+            'other_tickers': [],  # Empty - only using top gainers now
             'last_refresh': trading_bot.last_stock_discovery.isoformat() if trading_bot.last_stock_discovery else None
         })
     except Exception as e:
@@ -507,25 +545,34 @@ def get_monitoring_status():
 
 @app.route('/api/rejected-entries')
 def get_rejected_entries():
-    """Get list of rejected entry signals"""
+    """Get list of rejected entry signals for the current day from database"""
     global trading_bot
     if not trading_bot:
         return jsonify({'rejected_entries': []}), 200
     
     try:
-        rejected_entries = getattr(trading_bot, 'rejected_entries', [])
-        # Convert datetime objects to ISO format strings
+        from datetime import datetime
+        import pytz
+        
+        # Get current date in ET timezone
+        et = pytz.timezone('US/Eastern')
+        now = datetime.now(et)
+        date_str = now.strftime('%Y-%m-%d')
+        
+        # Load from database (persisted data)
+        rejected_entries = trading_bot.db.get_rejected_entries(date=date_str, limit=200)
+        
+        # Convert to API format
         entries_data = []
         for entry in rejected_entries:
-            timestamp = entry.get('timestamp')
-            if timestamp:
-                # Handle both datetime objects and strings
-                if hasattr(timestamp, 'isoformat'):
-                    timestamp_str = timestamp.isoformat()
+            timestamp_str = entry.get('timestamp')
+            # If timestamp is already a string (from database), use it as-is
+            # If it's a datetime object, convert to ISO format
+            if timestamp_str and not isinstance(timestamp_str, str):
+                if hasattr(timestamp_str, 'isoformat'):
+                    timestamp_str = timestamp_str.isoformat()
                 else:
-                    timestamp_str = str(timestamp)
-            else:
-                timestamp_str = None
+                    timestamp_str = str(timestamp_str)
             
             entries_data.append({
                 'ticker': entry.get('ticker', ''),
@@ -533,8 +580,9 @@ def get_rejected_entries():
                 'reason': entry.get('reason', ''),
                 'timestamp': timestamp_str
             })
-        # Return in reverse order (most recent first)
-        return jsonify({'rejected_entries': list(reversed(entries_data))})
+        
+        # Return in reverse order (most recent first) - database already returns DESC
+        return jsonify({'rejected_entries': entries_data})
     except Exception as e:
         logger.error(f"Error getting rejected entries: {e}")
         import traceback
@@ -587,17 +635,21 @@ def get_trades():
             # Normalize ticker to string
             trade['ticker'] = str(ticker).strip()
             
-            # Ensure numeric values are properly typed
+            # Ensure numeric values are properly typed (handle None values)
             if 'shares' in trade:
-                trade['shares'] = float(trade['shares']) if trade['shares'] is not None else 0
+                trade['shares'] = float(trade['shares']) if trade['shares'] is not None and trade['shares'] != '' else 0.0
             if 'entry_price' in trade:
-                trade['entry_price'] = float(trade['entry_price']) if trade['entry_price'] is not None else 0
+                trade['entry_price'] = float(trade['entry_price']) if trade['entry_price'] is not None and trade['entry_price'] != '' else 0.0
             if 'exit_price' in trade:
-                trade['exit_price'] = float(trade['exit_price']) if trade['exit_price'] is not None else 0
+                trade['exit_price'] = float(trade['exit_price']) if trade['exit_price'] is not None and trade['exit_price'] != '' else 0.0
             if 'entry_value' in trade:
-                trade['entry_value'] = float(trade['entry_value']) if trade['entry_value'] is not None else 0
+                trade['entry_value'] = float(trade['entry_value']) if trade['entry_value'] is not None and trade['entry_value'] != '' else 0.0
             if 'exit_value' in trade:
-                trade['exit_value'] = float(trade['exit_value']) if trade['exit_value'] is not None else 0
+                trade['exit_value'] = float(trade['exit_value']) if trade['exit_value'] is not None and trade['exit_value'] != '' else 0.0
+            if 'pnl_dollars' in trade:
+                trade['pnl_dollars'] = float(trade['pnl_dollars']) if trade['pnl_dollars'] is not None and trade['pnl_dollars'] != '' else 0.0
+            if 'pnl_pct' in trade:
+                trade['pnl_pct'] = float(trade['pnl_pct']) if trade['pnl_pct'] is not None and trade['pnl_pct'] != '' else 0.0
             
             valid_trades.append(trade)
         
@@ -606,8 +658,10 @@ def get_trades():
         # Continue processing valid trades
         for trade in trades:
             
-            # Recalculate exit_value if it seems incorrect
-            if 'shares' in trade and 'exit_price' in trade and trade['shares'] > 0 and trade['exit_price'] > 0:
+            # Recalculate exit_value if it seems incorrect (ensure values are not None)
+            shares = trade.get('shares', 0) or 0
+            exit_price = trade.get('exit_price', 0) or 0
+            if shares > 0 and exit_price > 0:
                 expected_exit_value = trade['shares'] * trade['exit_price']
                 if 'exit_value' not in trade or abs(trade.get('exit_value', 0) - expected_exit_value) > 0.01:
                     trade['exit_value'] = expected_exit_value
@@ -620,8 +674,10 @@ def get_trades():
                         else:
                             trade['pnl_pct'] = 0
             
-            # Ensure entry_value is correct
-            if 'shares' in trade and 'entry_price' in trade and trade['shares'] > 0 and trade['entry_price'] > 0:
+            # Ensure entry_value is correct (ensure values are not None)
+            shares = trade.get('shares', 0) or 0
+            entry_price = trade.get('entry_price', 0) or 0
+            if shares > 0 and entry_price > 0:
                 expected_entry_value = trade['shares'] * trade['entry_price']
                 if 'entry_value' not in trade or abs(trade.get('entry_value', 0) - expected_entry_value) > 0.01:
                     trade['entry_value'] = expected_entry_value
@@ -639,9 +695,9 @@ def get_trades():
             if isinstance(pnl_dollars, (str, int)):
                 pnl_dollars = float(pnl_dollars)
             
-            # Verify status matches actual P&L
-            exit_price = float(trade.get('exit_price', 0))
-            entry_price = float(trade.get('entry_price', 0))
+            # Verify status matches actual P&L (ensure values are not None)
+            exit_price = float(trade.get('exit_price', 0) or 0)
+            entry_price = float(trade.get('entry_price', 0) or 0)
             
             # Recalculate P&L if prices suggest different status
             if exit_price > 0 and entry_price > 0:

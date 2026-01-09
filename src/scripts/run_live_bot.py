@@ -76,43 +76,19 @@ def main():
     # 4. Use 'manual TICKER1 TICKER2 ...' for specific tickers
     if len(sys.argv) > 1:
         if sys.argv[1].lower() == 'auto':
-            # Auto-fetch from multiple sources using StockDiscovery
-            logger.info("Auto-discovering tickers from multiple sources (gainers, news, most active, etc.)...")
+            # Auto-fetch from top gainers
+            logger.info("Fetching tickers from top gainers...")
             try:
-                from analysis.stock_discovery import StockDiscovery
-                discovery = StockDiscovery(api)
-                TICKERS = discovery.discover_stocks(
-                    include_gainers=True,
-                    include_news=True,
-                    include_most_active=True,
-                    include_unusual_volume=True,
-                    include_breakouts=True,
-                    include_reversals=False,
-                    max_total=30
-                )
+                TICKERS = api.get_stock_list_from_gainers(count=20)
                 if not TICKERS:
-                    logger.warning("No tickers discovered, trying top gainers only...")
-                    TICKERS = api.get_stock_list_from_gainers(count=20)
-                    if not TICKERS:
-                        TICKERS = api.get_stock_list_from_swing_screener(count=20, min_price=5.0, max_price=100.0)
-                logger.info(f"Discovered {len(TICKERS)} tickers from multiple sources: {TICKERS[:10]}...")
-            except ImportError:
-                logger.warning("StockDiscovery not available, using top gainers only...")
-                try:
-                    TICKERS = api.get_stock_list_from_gainers(count=20)
-                    if not TICKERS:
-                        TICKERS = api.get_stock_list_from_swing_screener(count=20, min_price=5.0, max_price=100.0)
-                except:
-                    TICKERS = ["YIBO", "TVGN", "NAOV"]
+                    logger.warning("No tickers returned from top gainers, starting with empty list. Bot will fetch tickers automatically.")
+                    TICKERS = []
+                else:
+                    logger.info(f"Fetched {len(TICKERS)} tickers from top gainers: {TICKERS[:10]}...")
             except Exception as e:
-                logger.error(f"Error discovering stocks: {e}")
-                logger.info("Falling back to top gainers only...")
-                try:
-                    TICKERS = api.get_stock_list_from_gainers(count=20)
-                    if not TICKERS:
-                        TICKERS = ["YIBO", "TVGN", "NAOV"]
-                except:
-                    TICKERS = ["YIBO", "TVGN", "NAOV"]
+                logger.error(f"Error fetching top gainers: {e}")
+                logger.warning("Starting with empty ticker list. Bot will fetch tickers automatically when it starts.")
+                TICKERS = []
         elif sys.argv[1].lower() == 'swing':
             # Auto-fetch from swing screener
             logger.info("Auto-fetching tickers from Webull swing screener...")
@@ -124,8 +100,8 @@ def main():
                 logger.info(f"Fetched {len(TICKERS)} tickers from Webull API: {TICKERS[:10]}...")
             except Exception as e:
                 logger.error(f"Error fetching from Webull API: {e}")
-                logger.info("Falling back to default tickers...")
-                TICKERS = ["YIBO", "TVGN", "NAOV"]
+                logger.warning("Starting with empty ticker list. Bot will fetch tickers automatically when it starts.")
+                TICKERS = []
         elif sys.argv[1].lower() == 'manual':
             # Use provided tickers after 'manual' keyword
             if len(sys.argv) > 2:
@@ -140,35 +116,19 @@ def main():
             TICKERS = sys.argv[1:]
             logger.info(f"Using provided tickers: {TICKERS}")
     else:
-        # DEFAULT: Auto-discover from multiple sources
-        logger.info("No tickers specified - discovering from multiple sources (default behavior)...")
+        # DEFAULT: Fetch from top gainers
+        logger.info("No tickers specified - fetching from top gainers (default behavior)...")
         try:
-            from stock_discovery import StockDiscovery
-            discovery = StockDiscovery(api)
-            TICKERS = discovery.discover_stocks(
-                include_gainers=True,
-                include_news=True,
-                include_most_active=True,
-                include_unusual_volume=True,
-                include_breakouts=True,
-                include_reversals=False,
-                max_total=30
-            )
+            TICKERS = api.get_stock_list_from_gainers(count=20)
             if not TICKERS:
-                logger.warning("No tickers discovered, trying top gainers only...")
-                TICKERS = api.get_stock_list_from_gainers(count=20)
-                if not TICKERS:
-                    TICKERS = api.get_stock_list_from_swing_screener(count=20, min_price=5.0, max_price=100.0)
-            if TICKERS:
-                logger.info(f"Successfully fetched {len(TICKERS)} tickers from Webull API")
-                logger.info(f"Tickers: {TICKERS[:10]}...")
+                logger.warning("No tickers returned from top gainers, starting with empty list. Bot will fetch tickers automatically.")
+                TICKERS = []
             else:
-                logger.warning("No tickers available from Webull API, using fallback list")
-                TICKERS = ["YIBO", "TVGN", "NAOV"]
+                logger.info(f"Fetched {len(TICKERS)} tickers from top gainers: {TICKERS[:10]}...")
         except Exception as e:
-            logger.error(f"Error fetching from Webull API: {e}")
-            logger.info("Falling back to default tickers...")
-            TICKERS = ["YIBO", "TVGN", "NAOV"]
+            logger.error(f"Error fetching top gainers: {e}")
+            logger.warning("Starting with empty ticker list. Bot will fetch tickers automatically when it starts.")
+            TICKERS = []
         
         logger.info("")
         logger.info("Usage options:")

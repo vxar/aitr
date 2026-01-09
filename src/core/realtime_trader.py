@@ -8,6 +8,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+import pytz
 from analysis.pattern_detector import PatternDetector, PatternSignal
 
 logger = logging.getLogger(__name__)
@@ -221,9 +222,24 @@ class RealtimeTrader:
             if signal.entry_price < 0.50:
                 self.last_rejection_reasons[ticker].append(f"Entry price ${signal.entry_price:.4f} below minimum $0.50")
                 continue
-            # Check minimum confidence (must be high)
-            if signal.confidence < self.min_confidence:
-                self.last_rejection_reasons[ticker].append(f"Confidence {signal.confidence*100:.1f}% < {self.min_confidence*100:.0f}% required")
+            
+            # PRIORITY 3 FIX: Lower confidence threshold for fast movers
+            # Detect fast mover characteristics before confidence check
+            volume_ratio = current.get('volume_ratio', 0)
+            price_momentum_5 = ((current.get('close', 0) - df_with_indicators.iloc[max(0, current_idx-5)].get('close', 0)) / 
+                               df_with_indicators.iloc[max(0, current_idx-5)].get('close', 0)) * 100 if current_idx >= 5 else 0
+            
+            is_fast_mover = volume_ratio >= 2.5 and price_momentum_5 >= 3.0
+            
+            # Adjust confidence threshold for fast movers
+            effective_min_confidence = self.min_confidence
+            if is_fast_mover:
+                effective_min_confidence = 0.70  # Lower to 70% for fast movers
+                logger.debug(f"[{ticker}] FAST MOVER: Using relaxed confidence threshold 70% (vol={volume_ratio:.2f}x, momentum={price_momentum_5:.1f}%)")
+            
+            # Check minimum confidence with adjusted threshold
+            if signal.confidence < effective_min_confidence:
+                self.last_rejection_reasons[ticker].append(f"Confidence {signal.confidence*100:.1f}% < {effective_min_confidence*100:.0f}% required")
                 continue
             
             # PRIORITY 1: Check for false breakouts FIRST (most important filter)
@@ -365,6 +381,51 @@ class RealtimeTrader:
         if current_price > position.max_price_reached:
             position.max_price_reached = current_price
         
+        # PRIORITY 1: Check if entry was during premarket and calculate hold time
+        entry_time = position.entry_time
+        et = pytz.timezone('US/Eastern')
+        
+        # Normalize entry_time to ET timezone
+        if isinstance(entry_time, pd.Timestamp):
+            if entry_time.tz is None:
+                entry_time_et = entry_time.tz_localize('US/Eastern')
+            else:
+                entry_time_et = entry_time.tz_convert('US/Eastern')
+        elif hasattr(entry_time, 'astimezone'):
+            entry_time_et = entry_time.astimezone(et)
+        else:
+            entry_time_et = pd.to_datetime(entry_time)
+            if entry_time_et.tz is None:
+                entry_time_et = entry_time_et.tz_localize('US/Eastern')
+            else:
+                entry_time_et = entry_time_et.tz_convert('US/Eastern')
+        
+        entry_hour = entry_time_et.hour
+        entry_minute = entry_time_et.minute
+        is_premarket_entry = entry_hour < 9 or (entry_hour == 9 and entry_minute < 30)
+        
+        # Normalize current_time to ET timezone
+        if isinstance(current_time, pd.Timestamp):
+            if current_time.tz is None:
+                current_time_et = current_time.tz_localize('US/Eastern')
+            else:
+                current_time_et = current_time.tz_convert('US/Eastern')
+        elif hasattr(current_time, 'astimezone'):
+            current_time_et = current_time.astimezone(et)
+        else:
+            current_time_et = pd.to_datetime(current_time)
+            if current_time_et.tz is None:
+                current_time_et = current_time_et.tz_localize('US/Eastern')
+            else:
+                current_time_et = current_time_et.tz_convert('US/Eastern')
+        
+        # Calculate minutes since entry
+        time_diff = current_time_et - entry_time_et
+        minutes_since_entry = time_diff.total_seconds() / 60
+        
+        # Minimum hold time for premarket entries (15 minutes)
+        min_hold_time_premarket = 15
+        
         # Check exit conditions
         exit_reason = None
         
@@ -383,57 +444,82 @@ class RealtimeTrader:
             exit_reason = f"Profit target reached at ${position.target_price:.4f}"
         
         # 3. Progressive trailing stop (tightens as profit increases)
+        # PRIORITY 1: Skip trailing stop if within minimum hold time for premarket entries
+        # PRIORITY 2: Use wider trailing stops during premarket
         # FIX: Only activate trailing stop after minimum profit threshold (3%)
         # This prevents premature exits on small price movements
         elif position.max_price_reached > 0 and position.unrealized_pnl_pct >= 3.0:
-            # Calculate progressive trailing stop based on profit level
-            unrealized_pnl_pct = position.unrealized_pnl_pct
-            
-            # Progressive trailing stop width - wider for bigger winners
-            if unrealized_pnl_pct >= 15:
-                trailing_stop_pct = 5.0  # Very wide for big winners (let them run)
-            elif unrealized_pnl_pct >= 10:
-                trailing_stop_pct = 4.0  # Wider stop for big winners
-            elif unrealized_pnl_pct >= 7:
-                trailing_stop_pct = 3.5  # Medium stop
-            elif unrealized_pnl_pct >= 5:
-                trailing_stop_pct = 3.0  # Wider stop
-                # Move stop to breakeven after +5% profit (partial exit handles +4%)
-                if position.stop_loss < position.entry_price:
-                    position.stop_loss = position.entry_price
-                    logger.info(f"[{ticker}] Stop moved to breakeven at ${position.entry_price:.4f} (+{unrealized_pnl_pct:.2f}% profit)")
+            # PRIORITY 1: Minimum hold time protection for premarket entries
+            if is_premarket_entry and minutes_since_entry < min_hold_time_premarket:
+                # Don't exit on trailing stop during minimum hold period
+                # Only allow hard stop loss, profit target, setup failure, or trend reversal exits
+                logger.debug(f"[{ticker}] Premarket entry: {minutes_since_entry:.1f} min since entry, skipping trailing stop (min {min_hold_time_premarket} min)")
             else:
-                trailing_stop_pct = 2.5  # Initial trailing stop (only if profit >= 3%)
-            
-            # FIX: Use ATR-based stop if available (better for volatile stocks)
-            # Otherwise fallback to percentage-based stop
-            # Use the current row (already defined above as df_with_indicators.iloc[-1])
-            atr = current.get('atr', 0)
-            
-            if pd.notna(atr) and atr > 0:
-                # Use 2x ATR for trailing stop (wider for volatile stocks)
-                trailing_stop = position.max_price_reached - (atr * 2)
-                logger.debug(f"[{ticker}] ATR-based trailing stop: ${trailing_stop:.4f} (ATR: ${atr:.4f})")
-            else:
-                # Fallback to percentage-based stop
-                trailing_stop = position.max_price_reached * (1 - trailing_stop_pct / 100)
-            
-            # FIX: Ensure trailing stop never goes below entry price
-            # This protects against setting stops that would cause losses
-            trailing_stop = max(trailing_stop, position.entry_price)
-            
-            # FIX: Trailing stop only moves UP, never down
-            # This ensures we protect profits and don't give back gains
-            if position.trailing_stop_price is None:
-                position.trailing_stop_price = trailing_stop
-                logger.info(f"[{ticker}] Trailing stop activated at ${trailing_stop:.4f} (+{unrealized_pnl_pct:.2f}% profit)")
-            elif trailing_stop > position.trailing_stop_price:
-                position.trailing_stop_price = trailing_stop
-                logger.debug(f"[{ticker}] Trailing stop moved up to ${trailing_stop:.4f}")
-            # Never move stop down - this protects profits
-            
-            if current_price <= position.trailing_stop_price:
-                exit_reason = f"Trailing stop hit at ${position.trailing_stop_price:.4f} ({trailing_stop_pct:.1f}% from high)"
+                # Calculate progressive trailing stop based on profit level
+                unrealized_pnl_pct = position.unrealized_pnl_pct
+                
+                # Progressive trailing stop width - wider for bigger winners
+                if unrealized_pnl_pct >= 15:
+                    trailing_stop_pct = 5.0  # Very wide for big winners (let them run)
+                elif unrealized_pnl_pct >= 10:
+                    trailing_stop_pct = 4.0  # Wider stop for big winners
+                elif unrealized_pnl_pct >= 7:
+                    trailing_stop_pct = 3.5  # Medium stop
+                elif unrealized_pnl_pct >= 5:
+                    trailing_stop_pct = 3.0  # Wider stop
+                    # Move stop to breakeven after +5% profit (partial exit handles +4%)
+                    if position.stop_loss < position.entry_price:
+                        position.stop_loss = position.entry_price
+                        logger.info(f"[{ticker}] Stop moved to breakeven at ${position.entry_price:.4f} (+{unrealized_pnl_pct:.2f}% profit)")
+                else:
+                    trailing_stop_pct = 2.5  # Initial trailing stop (only if profit >= 3%)
+                
+                # PRIORITY 2: Wider trailing stops during premarket (1.5x normal width)
+                # Check if we're still in premarket or if entry was premarket
+                if isinstance(current_time_et, pd.Timestamp):
+                    current_hour = current_time_et.hour
+                    current_minute = current_time_et.minute
+                else:
+                    current_hour = current_time_et.hour
+                    current_minute = current_time_et.minute
+                is_currently_premarket = current_hour < 9 or (current_hour == 9 and current_minute < 30)
+                
+                if is_premarket_entry or is_currently_premarket:
+                    # Apply 1.5x multiplier for premarket (wider stops)
+                    trailing_stop_pct = trailing_stop_pct * 1.5
+                    # Cap at reasonable maximum (6%) to prevent excessive risk
+                    trailing_stop_pct = min(trailing_stop_pct, 6.0)
+                    logger.debug(f"[{ticker}] Premarket: Using wider trailing stop {trailing_stop_pct:.1f}% (1.5x normal)")
+                
+                # FIX: Use ATR-based stop if available (better for volatile stocks)
+                # Otherwise fallback to percentage-based stop
+                # Use the current row (already defined above as df_with_indicators.iloc[-1])
+                atr = current.get('atr', 0)
+                
+                if pd.notna(atr) and atr > 0:
+                    # Use 2x ATR for trailing stop (wider for volatile stocks)
+                    trailing_stop = position.max_price_reached - (atr * 2)
+                    logger.debug(f"[{ticker}] ATR-based trailing stop: ${trailing_stop:.4f} (ATR: ${atr:.4f})")
+                else:
+                    # Fallback to percentage-based stop
+                    trailing_stop = position.max_price_reached * (1 - trailing_stop_pct / 100)
+                
+                # FIX: Ensure trailing stop never goes below entry price
+                # This protects against setting stops that would cause losses
+                trailing_stop = max(trailing_stop, position.entry_price)
+                
+                # FIX: Trailing stop only moves UP, never down
+                # This ensures we protect profits and don't give back gains
+                if position.trailing_stop_price is None:
+                    position.trailing_stop_price = trailing_stop
+                    logger.info(f"[{ticker}] Trailing stop activated at ${trailing_stop:.4f} (+{unrealized_pnl_pct:.2f}% profit)")
+                elif trailing_stop > position.trailing_stop_price:
+                    position.trailing_stop_price = trailing_stop
+                    logger.debug(f"[{ticker}] Trailing stop moved up to ${trailing_stop:.4f}")
+                # Never move stop down - this protects profits
+                
+                if current_price <= position.trailing_stop_price:
+                    exit_reason = f"Trailing stop hit at ${position.trailing_stop_price:.4f} ({trailing_stop_pct:.1f}% from high)"
         
         # 4. Trend weakness/reversal signals
         elif self._detect_trend_weakness(df_with_indicators, position):
@@ -550,20 +636,46 @@ class RealtimeTrader:
                 logger.debug(f"[{signal.ticker}] REJECTED: {', '.join(rejection_reasons)}")
             return False, reason
         
-        # Only use the absolute best patterns
+        # PRIORITY 2 FIX: Use best patterns, but allow others with strong confirmations
         best_patterns = [
             'Strong_Bullish_Setup',  # Multiple indicators align
             'Volume_Breakout'  # High volume with price breakout
         ]
         
-        if signal.pattern_name not in best_patterns:
-            reason = f"Pattern '{signal.pattern_name}' not in best patterns"
-            if log_reasons:
-                rejection_reasons.append(reason)
-                logger.debug(f"[{signal.ticker}] REJECTED: {', '.join(rejection_reasons)}")
-            return False, reason
+        # Secondary patterns that are acceptable with strong confirmations
+        acceptable_patterns_with_confirmation = [
+            'Accumulation_Pattern',  # Volume accumulation with price action
+            'MACD_Bullish_Cross',  # MACD crossover with momentum
+        ]
         
         current = df.iloc[idx]
+        
+        if signal.pattern_name not in best_patterns:
+            # Check if it's an acceptable pattern with strong confirmations
+            if signal.pattern_name in acceptable_patterns_with_confirmation:
+                # Require stronger confirmations for secondary patterns
+                volume_ratio_check = current.get('volume_ratio', 0)
+                price_momentum = ((current.get('close', 0) - df.iloc[max(0, idx-5)].get('close', 0)) / 
+                                 df.iloc[max(0, idx-5)].get('close', 0)) * 100 if idx >= 5 else 0
+                
+                # Require: volume ratio > 2x AND (price momentum > 3% OR confidence > 75%)
+                if volume_ratio_check >= 2.0 and (price_momentum > 3.0 or signal.confidence >= 0.75):
+                    if log_reasons:
+                        logger.info(f"[{signal.ticker}] Accepting secondary pattern '{signal.pattern_name}' with strong confirmations (vol={volume_ratio_check:.2f}x, momentum={price_momentum:.1f}%, conf={signal.confidence*100:.1f}%)")
+                    # Pattern accepted, continue validation
+                else:
+                    reason = f"Pattern '{signal.pattern_name}' requires stronger confirmations (vol ratio {volume_ratio_check:.2f}x < 2.0x or momentum {price_momentum:.1f}% < 3% and confidence {signal.confidence*100:.1f}% < 75%)"
+                    if log_reasons:
+                        rejection_reasons.append(reason)
+                        logger.debug(f"[{signal.ticker}] REJECTED: {', '.join(rejection_reasons)}")
+                    return False, reason
+            else:
+                reason = f"Pattern '{signal.pattern_name}' not in best patterns"
+                if log_reasons:
+                    rejection_reasons.append(reason)
+                    logger.debug(f"[{signal.ticker}] REJECTED: {', '.join(rejection_reasons)}")
+                return False, reason
+        
         lookback_20 = df.iloc[idx-20:idx]
         lookback_10 = df.iloc[idx-10:idx]
         
@@ -646,12 +758,32 @@ class RealtimeTrader:
         
         # Check average volume over recent periods - additional liquidity check
         # Calculate average volume over 20 periods
+        # PRIORITY 1 FIX: Use volume ratio as primary check, relax threshold for fast movers
         if len(df) >= 20:
             avg_volume_20 = df['volume'].tail(20).mean()
             
-            # Minimum average volume threshold: 100,000 shares per minute average
-            # This ensures the stock has sufficient liquidity for trading
-            min_avg_volume = 100000  # 100K shares/minute average
+            # Calculate volume ratio (current vs historical average)
+            # Use longer-term average for comparison (if available)
+            if len(df) >= 100:
+                historical_avg = df['volume'].tail(100).mean()
+                volume_ratio_long = current.get('volume', 0) / historical_avg if historical_avg > 0 else 0
+            else:
+                historical_avg = avg_volume_20
+                volume_ratio_long = volume_ratio  # Use current volume_ratio if available
+            
+            # For fast movers (volume ratio > 3x), relax absolute volume requirement
+            is_fast_mover_volume = volume_ratio_long >= 3.0
+            
+            if is_fast_mover_volume:
+                # Fast movers: Lower threshold to 30K/minute (was 100K)
+                min_avg_volume = 30000
+                if log_reasons:
+                    logger.info(f"[{signal.ticker}] FAST MOVER VOLUME: Ratio {volume_ratio_long:.2f}x, using relaxed threshold {min_avg_volume:,}")
+            else:
+                # Normal stocks: Use market cap-adjusted threshold
+                # Small cap (<$50M): 30K, Mid cap ($50M-$1B): 50K, Large cap (>$1B): 100K
+                # For now, use 50K as default (can be enhanced with market cap data)
+                min_avg_volume = 50000
             
             if avg_volume_20 < min_avg_volume:
                 reason = f"Low volume stock (avg {avg_volume_20:,.0f} < {min_avg_volume:,} required)"

@@ -64,47 +64,17 @@ def create_trading_bot():
     # TICKER SELECTION
     # ============================================
     
-    # Use StockDiscovery to get stocks from multiple sources
-    logger.info("Discovering stocks from multiple sources (gainers, news, most active, etc.)...")
+    # Use top gainers only
+    logger.info("Fetching tickers from top gainers...")
     try:
-        from analysis.stock_discovery import StockDiscovery
-        
-        discovery = StockDiscovery(api)
-        TICKERS = discovery.discover_stocks(
-            include_gainers=True,  # Always include top gainers
-            include_news=True,  # Include news-driven stocks
-            include_most_active=True,  # Include most active stocks
-            include_unusual_volume=True,  # Include unusual volume stocks
-            include_breakouts=True,  # Include breakout candidates
-            include_reversals=False,  # Don't include reversals (more risky)
-            max_total=30  # Get up to 30 unique stocks
-        )
-        
-        if TICKERS:
-            logger.info(f"Successfully discovered {len(TICKERS)} tickers from multiple sources")
-            logger.info(f"Tickers: {TICKERS[:10]}...")
-        else:
-            logger.warning("No tickers discovered, falling back to top gainers only...")
-            TICKERS = api.get_stock_list_from_gainers(count=20)
-            if not TICKERS:
-                TICKERS = ["YIBO", "TVGN", "NAOV"]
-    except ImportError as e:
-        logger.warning(f"StockDiscovery not available: {e}, using top gainers only...")
-        try:
-            TICKERS = api.get_stock_list_from_gainers(count=20)
-            if not TICKERS:
-                TICKERS = api.get_stock_list_from_swing_screener(count=20, min_price=5.0, max_price=100.0)
-        except:
-            TICKERS = ["YIBO", "TVGN", "NAOV"]
+        TICKERS = api.get_stock_list_from_gainers(count=20)
+        if not TICKERS:
+            logger.warning("No tickers returned from top gainers, starting with empty list. Bot will fetch tickers automatically.")
+            TICKERS = []
     except Exception as e:
-        logger.error(f"Error discovering stocks: {e}")
-        logger.info("Falling back to top gainers only...")
-        try:
-            TICKERS = api.get_stock_list_from_gainers(count=20)
-            if not TICKERS:
-                TICKERS = ["YIBO", "TVGN", "NAOV"]
-        except:
-            TICKERS = ["YIBO", "TVGN", "NAOV"]
+        logger.error(f"Error fetching top gainers: {e}")
+        logger.warning("Starting with empty ticker list. Bot will fetch tickers automatically when it starts.")
+        TICKERS = []
     
     # ============================================
     # CREATE BOT (but don't start it yet)

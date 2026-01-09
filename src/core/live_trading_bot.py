@@ -125,7 +125,7 @@ class LiveTradingBot:
         self.monitoring_status: Dict[str, Dict] = {}  # Track monitoring status for each ticker
         self.last_stock_discovery: Optional[datetime] = None  # Track when we last refreshed stock list
         self.stock_discovery_interval_minutes = 1  # Refresh stock list every 1 minute (keep list fresh)
-        self.top_gainers: List[str] = []  # Track top gainers separately from other sources
+        self.top_gainers: List[str] = []  # Track top gainers
         self.top_gainers_data: List[Dict] = []  # Store full gainer data with change % for sorting
         self.rejected_entries: List[Dict] = []  # Track rejected entry signals for display (keep last 50)
         
@@ -323,117 +323,6 @@ class LiveTradingBot:
             except Exception as e:
                 logger.error(f"Error updating tickers from gainers: {e}")
     
-    def update_tickers_from_swing_screener(self, max_tickers: int = 20, 
-                                          min_price: float = 5.0, 
-                                          max_price: float = 100.0):
-        """
-        Update ticker list from swing stock screener (if using WebullDataAPI)
-        
-        Args:
-            max_tickers: Maximum number of tickers to fetch
-            min_price: Minimum price filter
-            max_price: Maximum price filter
-        """
-        if hasattr(self.data_api, 'get_stock_list_from_swing_screener'):
-            try:
-                new_tickers = self.data_api.get_stock_list_from_swing_screener(
-                    count=max_tickers, min_price=min_price, max_price=max_price
-                )
-                # Add new tickers that aren't already being monitored
-                added = 0
-                for ticker in new_tickers:
-                    if ticker not in self.tickers:
-                        self.add_ticker(ticker)
-                        added += 1
-                if added > 0:
-                    logger.info(f"Updated ticker list: Added {added} new tickers from swing screener")
-            except Exception as e:
-                logger.error(f"Error updating tickers from swing screener: {e}")
-    
-    def update_tickers_from_multiple_sources(self, max_tickers: int = 30,
-                                            include_news: bool = True,
-                                            include_most_active: bool = True,
-                                            include_unusual_volume: bool = True,
-                                            include_breakouts: bool = True,
-                                            include_reversals: bool = False):
-        """
-        Update ticker list from multiple sources using StockDiscovery
-        
-        Args:
-            max_tickers: Maximum total number of unique tickers to add
-            include_news: Include news-driven stocks
-            include_most_active: Include most active stocks
-            include_unusual_volume: Include unusual volume stocks
-            include_breakouts: Include breakout candidates
-            include_reversals: Include reversal candidates (more risky)
-        """
-        try:
-            from analysis.stock_discovery import StockDiscovery
-            
-            discovery = StockDiscovery(self.data_api)
-            
-            # Get top gainers separately (with change % data for sorting)
-            try:
-                # Get full gainer data (not just symbols) to access change percentage
-                gainer_data = self.data_api.get_top_gainers(page_size=20)
-                # Sort by change percentage (descending - highest first)
-                gainer_data_sorted = sorted(
-                    gainer_data, 
-                    key=lambda x: x.get('change_ratio', 0) or x.get('changeRatio', 0) or 0, 
-                    reverse=True
-                )
-                # Store both symbols and full data for display
-                gainer_tickers = [g.get('symbol', '') for g in gainer_data_sorted if g.get('symbol')]
-                self.top_gainers = gainer_tickers[:20]
-                # Store full gainer data with change % for API endpoint
-                self.top_gainers_data = gainer_data_sorted[:20]
-            except Exception as e:
-                logger.warning(f"Error fetching top gainers: {e}")
-                gainer_tickers = []
-                self.top_gainers_data = []
-            
-            # Get other sources (news, most active, etc.)
-            other_tickers = discovery.discover_stocks(
-                include_gainers=False,  # Don't include gainers here, we handle them separately
-                include_news=include_news,
-                include_most_active=include_most_active,
-                include_unusual_volume=include_unusual_volume,
-                include_breakouts=include_breakouts,
-                include_reversals=include_reversals,
-                max_total=max_tickers - len(gainer_tickers)  # Reserve space for gainers
-            )
-            
-            # Combine gainers and other sources
-            new_tickers = gainer_tickers + other_tickers
-            
-            # Add new tickers that aren't already being monitored or in active positions
-            added = 0
-            active_tickers = set(self.trader.active_positions.keys())
-            
-            for ticker in new_tickers:
-                if (ticker not in self.tickers and 
-                    ticker not in active_tickers and
-                    len(ticker) <= 5):  # Valid ticker symbol
-                    self.add_ticker(ticker)
-                    added += 1
-            
-            if added > 0:
-                logger.info(f"Updated ticker list: Added {added} new tickers (Top Gainers: {len(gainer_tickers)}, Other: {len(other_tickers)})")
-                logger.info(f"Total tickers being monitored: {len(self.tickers)}")
-            else:
-                logger.debug(f"Stock list refreshed: Top Gainers: {len(gainer_tickers)}, Other: {len(other_tickers)}, Total monitored: {len(self.tickers)}")
-                
-        except ImportError as e:
-            logger.warning(f"StockDiscovery module not available: {e}")
-            # Fallback to gainers only
-            self.update_tickers_from_gainers(max_tickers=max_tickers)
-        except Exception as e:
-            logger.error(f"Error updating tickers from multiple sources: {e}")
-            # Fallback to gainers only
-            try:
-                self.update_tickers_from_gainers(max_tickers=max_tickers)
-            except:
-                pass
     
     def _get_current_et_time(self) -> datetime:
         """Get current time in Eastern Time"""
@@ -541,7 +430,7 @@ class LiveTradingBot:
             logger.info(f"New Trading Day: {current_date}")
             logger.info(f"   Starting Capital: ${self.daily_start_capital:,.2f}")
             logger.info(f"   Daily Limits: Max Trades={self.max_trades_per_day}, Max Loss=DISABLED (unlimited)")
-            logger.info(f"   Consecutive Loss Limit: {self.consecutive_loss_limit}")
+            logger.info(f"   Consecutive Loss Limit: DISABLED (testing mode - all trades allowed)")
             logger.info(f"   Daily Profit Target: ${self.daily_profit_target_min:,.2f} - ${self.daily_profit_target_max:,.2f}")
             logger.info(f"   Current Daily Profit: ${self.daily_profit:+,.2f}")
     
@@ -933,16 +822,8 @@ class LiveTradingBot:
             # 3. Daily loss limit REMOVED - allow trading regardless of daily loss
             # This prevents missing opportunities like JTAI where a big move happens after initial losses
             
-            # 4. Check consecutive losses
-            if self.consecutive_losses >= self.consecutive_loss_limit:
-                if not self.trading_paused:
-                    self.trading_paused = True
-                    self.pause_reason = f"Consecutive losses limit reached: {self.consecutive_losses} losses"
-                    logger.warning(f"🛑 AUTO-PAUSE: {self.pause_reason}")
-                reason = f"Consecutive losses limit reached ({self.consecutive_losses})"
-                logger.warning(f"❌ REJECTED ENTRY: {signal.ticker} @ ${signal.price:.4f} - {reason}")
-                self._add_rejected_entry(signal.ticker, signal.price, reason)
-                return False
+            # 4. Consecutive loss limit REMOVED - allow trading regardless of consecutive losses
+            # This is disabled for testing mode to allow all possible trades for fine-tuning
             
             # Check if we have enough capital
             position_value = self.current_capital * self.position_size_pct
@@ -1028,6 +909,11 @@ class LiveTradingBot:
             
             # Clear any rejected entries for this ticker since we successfully entered
             self.rejected_entries = [r for r in self.rejected_entries if r['ticker'] != signal.ticker]
+            # Also clear from database
+            try:
+                self.db.clear_rejected_entries_for_ticker(signal.ticker)
+            except Exception as e:
+                logger.error(f"Error clearing rejected entries from database: {e}")
             
             # Validate ticker before saving position
             ticker = str(signal.ticker).strip() if signal.ticker else None
@@ -1170,16 +1056,12 @@ class LiveTradingBot:
             if len(self.recent_trades) > self.win_rate_window:
                 self.recent_trades.pop(0)
             
-            # Update consecutive losses counter
+            # Update consecutive losses counter (for logging/informational purposes only)
             if pnl_dollars < 0:
                 self.consecutive_losses += 1
+                logger.debug(f"Consecutive losses: {self.consecutive_losses} (tracking only, not blocking trades)")
             else:
                 self.consecutive_losses = 0  # Reset on win
-                # Auto-resume if paused due to consecutive losses
-                if self.trading_paused and "consecutive losses" in self.pause_reason.lower():
-                    self.trading_paused = False
-                    self.pause_reason = ""
-                    logger.info("✅ AUTO-RESUME: Win after consecutive losses, trading resumed")
             
             # Track exit time for re-entry logic
             self.ticker_exit_times[signal.ticker] = signal.timestamp
@@ -1480,7 +1362,7 @@ class LiveTradingBot:
         
         current_time = self._get_current_et_time()
         
-        # Periodically refresh stock list from multiple sources
+        # Periodically refresh stock list from top gainers
         should_refresh = False
         if self.last_stock_discovery is None:
             # First run - refresh immediately
@@ -1493,25 +1375,12 @@ class LiveTradingBot:
         
         if should_refresh:
             try:
-                logger.info("Refreshing stock list from multiple sources (gainers, news, most active, etc.)...")
-                self.update_tickers_from_multiple_sources(
-                    max_tickers=30,
-                    include_news=True,
-                    include_most_active=True,
-                    include_unusual_volume=True,
-                    include_breakouts=True,
-                    include_reversals=False  # Don't include reversals by default (more risky)
-                )
+                logger.info("Refreshing stock list from top gainers...")
+                self.update_tickers_from_gainers(max_tickers=20)
                 self.last_stock_discovery = current_time
-                logger.info(f"Stock list refreshed. Now monitoring {len(self.tickers)} tickers")
+                logger.info(f"Stock list refreshed. Now monitoring {len(self.tickers)} tickers from top gainers")
             except Exception as e:
-                logger.warning(f"Error refreshing stock list: {e}")
-                # Fallback to gainers only
-                try:
-                    self.update_tickers_from_gainers(max_tickers=20)
-                    self.last_stock_discovery = current_time
-                except:
-                    pass
+                logger.warning(f"Error refreshing stock list from top gainers: {e}")
         
         if not self.tickers:
             logger.warning("No tickers to monitor")
@@ -1929,24 +1798,34 @@ class LiveTradingBot:
     
     def _add_rejected_entry(self, ticker: str, price: float, reason: str):
         """
-        Add a rejected entry to the tracking list for UI display
+        Add a rejected entry to the tracking list and database for UI display
         
         Args:
             ticker: Stock ticker symbol
             price: Entry price that was rejected
             reason: Reason for rejection
         """
-        from datetime import datetime
+        et = pytz.timezone('US/Eastern')
+        now = datetime.now(et)
+        
         rejected_entry = {
             'ticker': ticker,
             'price': price,
             'reason': reason,
-            'timestamp': datetime.now()
+            'timestamp': now
         }
+        
+        # Add to in-memory list (for quick access)
         self.rejected_entries.append(rejected_entry)
-        # Keep only last 50 entries
+        # Keep only last 50 entries in memory
         if len(self.rejected_entries) > 50:
             self.rejected_entries = self.rejected_entries[-50:]
+        
+        # Save to database for persistence
+        try:
+            self.db.add_rejected_entry(ticker, price, reason, now)
+        except Exception as e:
+            logger.error(f"Error saving rejected entry to database: {e}")
 
 
 def main():
@@ -1962,9 +1841,9 @@ def main():
     if len(sys.argv) > 1:
         tickers = sys.argv[1:]
     else:
-        # Default tickers based on testing
-        tickers = ["TVGN", "YIBO", "NAOV"]
-        print(f"No tickers provided, using defaults: {tickers}")
+        # No hardcoded tickers - bot will fetch from top gainers automatically
+        tickers = []
+        print("No tickers provided. Bot will fetch tickers from top gainers automatically.")
         print("Usage: python live_trading_bot.py TICKER1 TICKER2 ...")
     
     # Initialize data API (replace CSVDataAPI with your live API)
